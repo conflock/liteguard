@@ -95,7 +95,7 @@ func (f *Failover) check() {
 
 	gap := f.receiver.SecondsSinceHeartbeat()
 	if gap > f.cfg.Timeout.Seconds() {
-		log.Printf("[failover] primary timeout (%.1fs > %.1fs) – promoting to primary", gap, f.cfg.Timeout.Seconds())
+		log.Printf("[failover] primary timeout (%.1fs > %.1fs) – starting election", gap, f.cfg.Timeout.Seconds())
 		f.promote()
 	}
 }
@@ -108,20 +108,28 @@ func (f *Failover) promote() {
 		return
 	}
 
-	// Leader election: wait a random delay (0-5s) then check if any
-	// peer replica has already stopped listening (meaning it promoted).
-	// This prevents multiple replicas from promoting simultaneously.
-	jitter := time.Duration(rand.Intn(5000)) * time.Millisecond
-	log.Printf("[failover] election: waiting %.1fs before promote check...", jitter.Seconds())
+	// Random wait so not all replicas try at the same time
+	jitter := time.Duration(rand.Intn(10000)) * time.Millisecond
+	log.Printf("[failover] election: waiting %.1fs...", jitter.Seconds())
 	time.Sleep(jitter)
 
-	if f.peerAlreadyPromoted() {
-		log.Printf("[failover] another replica already promoted, staying as replica")
+	// Stop listener FIRST so peers can see we are promoting
+	f.receiver.Stop()
+
+	// Brief pause so the port is fully released
+	time.Sleep(500 * time.Millisecond)
+
+	// Check if any peer ALSO stopped their listener (= also promoting)
+	if f.peerAlsoPromoting() {
+		// Another replica was faster. Restart our listener and stay replica.
+		log.Printf("[failover] another replica already promoted, restarting listener")
+		if err := f.receiver.Start(); err != nil {
+			log.Printf("[failover] CRITICAL: failed to restart receiver: %v", err)
+		}
 		return
 	}
 
-	f.receiver.Stop()
-
+	// We won the election
 	f.role.Store(int32(RolePrimary))
 	f.promoted.Store(true)
 
@@ -137,20 +145,18 @@ func (f *Failover) promote() {
 	}
 }
 
-// peerAlreadyPromoted checks if any other replica has already promoted
-// by trying to connect to their listen port.  A promoted replica stops
-// its listener, so a "connection refused" means it already promoted.
-// If the peer is still listening (connection succeeds), it has NOT
-// promoted yet.
-func (f *Failover) peerAlreadyPromoted() bool {
+// peerAlsoPromoting checks if any peer replica has ALSO stopped listening.
+// If a peer is NOT listening (connection refused), it means that peer
+// is also trying to promote. We yield to it and stay replica.
+// If all peers are still listening, we are the only one promoting -> we win.
+func (f *Failover) peerAlsoPromoting() bool {
 	for _, addr := range f.cfg.PeerAddrs {
 		if addr == "" {
 			continue
 		}
 		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 		if err != nil {
-			// Connection refused = peer stopped listening = peer promoted
-			log.Printf("[failover] peer %s not listening (likely promoted)", addr)
+			log.Printf("[failover] peer %s also not listening – yielding", addr)
 			return true
 		}
 		conn.Close()
