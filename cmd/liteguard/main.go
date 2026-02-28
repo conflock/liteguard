@@ -64,10 +64,15 @@ func main() {
 	}
 }
 
-// probeForExistingPrimary checks if any of the listed replica addresses
-// already has an active primary by trying to connect on the Liteguard port.
-// If a connection succeeds and we receive data (heartbeat/WAL), another
-// primary is already running.
+// probeForExistingPrimary checks if ANY replica address is reachable.
+// A reachable replica means it is listening for a primary connection,
+// which means either:
+//   - Another primary is already streaming to it, OR
+//   - It is waiting for a primary (our old role)
+//
+// In BOTH cases a server that was offline must NOT start as primary
+// because it has stale data. It must demote to replica first and
+// sync from the current primary.
 func probeForExistingPrimary(addrs []string) string {
 	for _, addr := range addrs {
 		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
@@ -75,12 +80,6 @@ func probeForExistingPrimary(addrs []string) string {
 			continue
 		}
 		conn.Close()
-		// If we can connect, that replica is listening -- it could be the
-		// promoted primary or just a replica. We check if the .primary
-		// marker exists on the remote side by checking if the port is open
-		// (replicas listen on 4200, promoted primaries don't).
-		// A listening replica means another primary exists that it's
-		// receiving from. Return this address as the active cluster.
 		return addr
 	}
 	return ""
@@ -96,23 +95,20 @@ func runPrimary(dbPath, replicaList string, heartbeat time.Duration, sig chan os
 		addrs[i] = strings.TrimSpace(addrs[i])
 	}
 
-	// Auto-demote: if this server was the original primary but was offline
-	// while a replica got promoted, detect the situation and refuse to start
-	// as a conflicting primary. The recovery script handles the actual
-	// mode switch; here we just detect and exit with a specific code.
-	markerPath := dbPath + ".primary"
-	if _, err := os.Stat(markerPath); err != nil {
-		// No .primary marker means we are the ORIGINAL primary (not promoted).
-		// Check if any replica is already listening (meaning another primary
-		// got promoted and is actively streaming to them).
-		active := probeForExistingPrimary(addrs)
-		if active != "" {
-			log.Printf("WARNING: Another primary appears active (replica %s is listening).", active)
-			log.Printf("This server was likely offline during a failover.")
-			log.Printf("Exiting with code 10 so the recovery script can demote to replica.")
-			os.Exit(10)
-		}
+	// CRITICAL: Before starting as primary, ALWAYS check if any replica
+	// is reachable. If a replica is listening, another primary may already
+	// be streaming to it, or we were offline and have stale data.
+	// In either case we MUST NOT start as primary -- we exit with code 10
+	// so the recovery script can demote us to replica.
+	// This check runs regardless of whether a .primary marker exists.
+	active := probeForExistingPrimary(addrs)
+	if active != "" {
+		log.Printf("CRITICAL: Replica %s is reachable. Another primary may be active.", active)
+		log.Printf("Refusing to start as primary to prevent data loss.")
+		log.Printf("Exiting with code 10 so the recovery script can demote to replica.")
+		os.Exit(10)
 	}
+	log.Printf("[primary] no active replicas found, safe to start as primary")
 
 	sender := internal.NewSender(internal.SenderConfig{
 		DBPath:            dbPath,
