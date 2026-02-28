@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          go build -ldflags="-s -w -X main.version=${VERSION}" \
+            -o liteguard-${{ matrix.goos }}-${{ matrix.goarch }} \
+            ./cmd/liteguard
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liteguard-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: liteguard-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          chmod +x artifacts/liteguard-*
+          gh release create "$TAG" artifacts/liteguard-* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Liteguard $TAG" \
+            --generate-notes

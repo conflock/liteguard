@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -27,6 +28,7 @@ type Sender struct {
 	mu        sync.RWMutex
 	stop      chan struct{}
 	lastSize  int64
+	walGuard  *os.File // shared lock on DB to prevent WAL auto-checkpoint
 }
 
 type replicaConn struct {
@@ -64,6 +66,20 @@ func (s *Sender) Start() error {
 		return fmt.Errorf("WAL directory not accessible: %w", err)
 	}
 
+	// Hold the DB file open with a shared (read) lock.
+	// SQLite skips WAL auto-checkpoint while any shared lock exists,
+	// keeping the WAL file alive for the poll loop to read and stream.
+	f, err := os.Open(s.cfg.DBPath)
+	if err != nil {
+		return fmt.Errorf("open DB for WAL guard: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return fmt.Errorf("acquire shared lock on DB: %w", err)
+	}
+	s.walGuard = f
+	log.Printf("[sender] WAL guard lock acquired on %s", s.cfg.DBPath)
+
 	for _, r := range s.replicas {
 		go s.connectLoop(r)
 	}
@@ -77,6 +93,10 @@ func (s *Sender) Start() error {
 
 func (s *Sender) Stop() {
 	close(s.stop)
+	if s.walGuard != nil {
+		syscall.Flock(int(s.walGuard.Fd()), syscall.LOCK_UN)
+		s.walGuard.Close()
+	}
 	for _, r := range s.replicas {
 		r.mu.Lock()
 		if r.conn != nil {
