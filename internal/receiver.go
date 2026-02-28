@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"database/sql"
 	"fmt"
 	"io"
 	"log"
@@ -9,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 type ReceiverConfig struct {
@@ -24,6 +27,7 @@ type Receiver struct {
 	lastHeartbeat  atomic.Int64
 	stop           chan struct{}
 	mu             sync.Mutex
+	db             *sql.DB
 }
 
 func NewReceiver(cfg ReceiverConfig) *Receiver {
@@ -41,6 +45,22 @@ func (r *Receiver) Start() error {
 	}
 	r.listener = ln
 
+	// Open a persistent SQLite connection for checkpointing received WAL frames.
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)", r.cfg.DBPath)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		ln.Close()
+		return fmt.Errorf("open receiver db: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		ln.Close()
+		return fmt.Errorf("receiver db ping: %w", err)
+	}
+	r.db = db
+
 	go r.acceptLoop()
 
 	log.Printf("[receiver] listening on %s, WAL target: %s", r.cfg.ListenAddr, r.walPath)
@@ -51,6 +71,9 @@ func (r *Receiver) Stop() {
 	close(r.stop)
 	if r.listener != nil {
 		r.listener.Close()
+	}
+	if r.db != nil {
+		r.db.Close()
 	}
 	log.Println("[receiver] stopped")
 }
@@ -115,7 +138,9 @@ func (r *Receiver) handleConnection(conn net.Conn) {
 	}
 }
 
-// applyWAL appends WAL frame data to the local WAL file.
+// applyWAL writes WAL frame data to the local WAL file, then runs a
+// PASSIVE checkpoint so that SQLite merges the frames into the main
+// database file. This makes the data immediately readable.
 func (r *Receiver) applyWAL(msg *Message) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -124,14 +149,21 @@ func (r *Receiver) applyWAL(msg *Message) error {
 	if err != nil {
 		return fmt.Errorf("open WAL: %w", err)
 	}
-	defer f.Close()
 
 	if _, err := f.Write(msg.Payload); err != nil {
+		f.Close()
 		return fmt.Errorf("write WAL: %w", err)
 	}
 
 	if err := f.Sync(); err != nil {
+		f.Close()
 		return fmt.Errorf("sync WAL: %w", err)
+	}
+	f.Close()
+
+	// Checkpoint WAL frames into the main DB so data is immediately readable.
+	if _, err := r.db.Exec("PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
+		log.Printf("[receiver] checkpoint warning: %v", err)
 	}
 
 	return nil
