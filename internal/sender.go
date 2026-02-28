@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -30,8 +31,8 @@ type Sender struct {
 	mu        sync.RWMutex
 	stop      chan struct{}
 	lastSize  int64
-	walGuard  *sql.DB  // connection pool (max 1) that holds the reader
-	walTx     *sql.Tx  // long-lived BEGIN that blocks WAL checkpoint
+	walGuard  *sql.DB
+	walTx     *sql.Tx
 }
 
 type replicaConn struct {
@@ -69,31 +70,55 @@ func (s *Sender) Start() error {
 		return fmt.Errorf("WAL directory not accessible: %w", err)
 	}
 
-	// Open a read-only SQLite connection and start a long-lived read
-	// transaction. SQLite cannot checkpoint the WAL while any reader
-	// holds a snapshot, so the WAL file stays alive for our poll loop
-	// to read and stream to replicas.
-	db, err := sql.Open("sqlite", s.cfg.DBPath+"?mode=ro")
+	// Mirror the approach used by Litestream:
+	// 1. Open connection with wal_autocheckpoint=0
+	// 2. Ensure WAL mode
+	// 3. Create a lock table if needed
+	// 4. Start a long-running read transaction that reads from the table
+	//    to acquire a SHARED lock on the database pages, preventing any
+	//    other connection from checkpointing the WAL.
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=wal_autocheckpoint(0)", s.cfg.DBPath)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return fmt.Errorf("open WAL guard connection: %w", err)
+		return fmt.Errorf("open WAL guard: %w", err)
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	tx, err := db.Begin()
+	var mode string
+	if err := db.QueryRow("PRAGMA journal_mode=WAL;").Scan(&mode); err != nil {
+		db.Close()
+		return fmt.Errorf("set WAL mode: %w", err)
+	}
+	if mode != "wal" {
+		db.Close()
+		return fmt.Errorf("WAL mode not enabled, got %q", mode)
+	}
+
+	if _, err := db.Exec("CREATE TABLE IF NOT EXISTS _liteguard_lock (id INTEGER PRIMARY KEY)"); err != nil {
+		db.Close()
+		return fmt.Errorf("create lock table: %w", err)
+	}
+	if _, err := db.Exec("INSERT OR IGNORE INTO _liteguard_lock (id) VALUES (1)"); err != nil {
+		db.Close()
+		return fmt.Errorf("seed lock table: %w", err)
+	}
+
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		db.Close()
-		return fmt.Errorf("begin WAL guard transaction: %w", err)
+		return fmt.Errorf("begin WAL guard tx: %w", err)
 	}
-	// Force the transaction to actually acquire a read lock
-	if _, err := tx.Exec("SELECT 1"); err != nil {
+	if _, err := tx.ExecContext(ctx, "SELECT COUNT(1) FROM _liteguard_lock"); err != nil {
 		tx.Rollback()
 		db.Close()
 		return fmt.Errorf("WAL guard read lock: %w", err)
 	}
+
 	s.walGuard = db
 	s.walTx = tx
-	log.Printf("[sender] WAL guard active (read transaction held) on %s", s.cfg.DBPath)
+	log.Printf("[sender] WAL guard active (read tx held) on %s", s.cfg.DBPath)
 
 	for _, r := range s.replicas {
 		go s.connectLoop(r)
