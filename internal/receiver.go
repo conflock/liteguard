@@ -121,6 +121,7 @@ func (r *Receiver) handleConnection(conn net.Conn) {
 				log.Printf("[receiver] apply WAL seq=%d failed: %v", msg.Sequence, err)
 				continue
 			}
+			log.Printf("[receiver] applied WAL seq=%d (%d bytes)", msg.Sequence, len(msg.Payload))
 			r.lastSequence.Store(msg.Sequence)
 			r.lastHeartbeat.Store(time.Now().UnixMilli())
 

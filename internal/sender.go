@@ -28,10 +28,11 @@ type Sender struct {
 	sequence  atomic.Uint64
 	replicas  []*replicaConn
 	mu        sync.RWMutex
-	stop      chan struct{}
-	lastSize  int64
-	walGuard  *sql.DB
-	walTx     *sql.Tx
+	stop        chan struct{}
+	lastSize    int64
+	lastModTime time.Time
+	walGuard    *sql.DB
+	walTx       *sql.Tx
 }
 
 type replicaConn struct {
@@ -222,15 +223,27 @@ func (s *Sender) checkWAL() {
 	}
 
 	currentSize := info.Size()
-	if currentSize == s.lastSize {
+	modTime := info.ModTime()
+
+	if currentSize == s.lastSize && modTime.Equal(s.lastModTime) {
 		return
 	}
 
-	// Send the complete WAL file so that the receiver always has a
-	// consistent copy with correct salt values and frame checksums.
+	if currentSize == 0 {
+		s.lastSize = 0
+		s.lastModTime = modTime
+		return
+	}
+
 	data, err := os.ReadFile(s.walPath)
 	if err != nil {
 		log.Printf("[sender] read WAL: %v", err)
+		return
+	}
+
+	if len(data) == 0 {
+		s.lastSize = 0
+		s.lastModTime = modTime
 		return
 	}
 
@@ -239,6 +252,7 @@ func (s *Sender) checkWAL() {
 
 	s.broadcast(msg)
 	s.lastSize = currentSize
+	s.lastModTime = modTime
 	log.Printf("[sender] WAL frame seq=%d (%d bytes) sent to replicas", seq, len(data))
 }
 
