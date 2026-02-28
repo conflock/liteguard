@@ -27,7 +27,6 @@ type Receiver struct {
 	lastHeartbeat  atomic.Int64
 	stop           chan struct{}
 	mu             sync.Mutex
-	db             *sql.DB
 }
 
 func NewReceiver(cfg ReceiverConfig) *Receiver {
@@ -45,22 +44,6 @@ func (r *Receiver) Start() error {
 	}
 	r.listener = ln
 
-	// Open a persistent SQLite connection for checkpointing received WAL frames.
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)", r.cfg.DBPath)
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		ln.Close()
-		return fmt.Errorf("open receiver db: %w", err)
-	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	if err := db.Ping(); err != nil {
-		db.Close()
-		ln.Close()
-		return fmt.Errorf("receiver db ping: %w", err)
-	}
-	r.db = db
-
 	go r.acceptLoop()
 
 	log.Printf("[receiver] listening on %s, WAL target: %s", r.cfg.ListenAddr, r.walPath)
@@ -71,9 +54,6 @@ func (r *Receiver) Stop() {
 	close(r.stop)
 	if r.listener != nil {
 		r.listener.Close()
-	}
-	if r.db != nil {
-		r.db.Close()
 	}
 	log.Println("[receiver] stopped")
 }
@@ -150,6 +130,11 @@ func (r *Receiver) handleConnection(conn net.Conn) {
 // received from the primary, then checkpoints it into the main DB.
 // The sender streams the complete WAL content (not deltas) so that
 // salt values and frame checksums stay consistent with the database.
+//
+// We open a fresh SQLite connection for each checkpoint because the
+// persistent r.db connection caches the WAL index in shared memory;
+// after we overwrite the WAL file externally that cached index is
+// stale and PASSIVE checkpoint would silently skip all frames.
 func (r *Receiver) applyWAL(msg *Message) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -158,8 +143,15 @@ func (r *Receiver) applyWAL(msg *Message) error {
 		return fmt.Errorf("write WAL: %w", err)
 	}
 
-	// Checkpoint into main DB so data is immediately readable.
-	if _, err := r.db.Exec("PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)", r.cfg.DBPath)
+	ckDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return fmt.Errorf("open checkpoint db: %w", err)
+	}
+	defer ckDB.Close()
+
+	ckDB.SetMaxOpenConns(1)
+	if _, err := ckDB.Exec("PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
 		log.Printf("[receiver] checkpoint warning: %v", err)
 	}
 
