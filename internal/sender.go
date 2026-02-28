@@ -239,6 +239,7 @@ func (s *Sender) checkWAL() {
 
 	s.broadcast(msg)
 	s.lastSize = currentSize
+	log.Printf("[sender] WAL frame seq=%d (%d bytes) sent to replicas", seq, len(data))
 }
 
 func (s *Sender) broadcast(msg *Message) {

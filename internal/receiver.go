@@ -134,6 +134,13 @@ func (r *Receiver) handleConnection(conn net.Conn) {
 		case MsgTypeHeartbeat:
 			r.lastHeartbeat.Store(time.Now().UnixMilli())
 			r.lastSequence.Store(msg.Sequence)
+
+			ack := NewAck(msg.Sequence)
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := ack.Encode(conn); err != nil {
+				log.Printf("[receiver] send heartbeat ACK failed: %v", err)
+				return
+			}
 		}
 	}
 }
