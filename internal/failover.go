@@ -94,12 +94,6 @@ func (f *Failover) check() {
 	}
 
 	gap := f.receiver.SecondsSinceHeartbeat()
-
-	// No heartbeat received yet – primary might not have connected
-	if gap < 0 {
-		return
-	}
-
 	if gap > f.cfg.Timeout.Seconds() {
 		log.Printf("[failover] primary timeout (%.1fs > %.1fs) – promoting to primary", gap, f.cfg.Timeout.Seconds())
 		f.promote()

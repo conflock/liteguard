@@ -31,11 +31,15 @@ type Receiver struct {
 }
 
 func NewReceiver(cfg ReceiverConfig) *Receiver {
-	return &Receiver{
+	r := &Receiver{
 		cfg:     cfg,
 		walPath: cfg.DBPath + "-wal",
 		stop:    make(chan struct{}),
 	}
+	// Seed heartbeat timer so failover can trigger even if no primary
+	// ever connects. Without this, replicas would wait forever.
+	r.lastHeartbeat.Store(time.Now().UnixMilli())
+	return r
 }
 
 func (r *Receiver) Start() error {
