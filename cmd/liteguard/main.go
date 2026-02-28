@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -64,27 +63,6 @@ func main() {
 	}
 }
 
-// probeForExistingPrimary checks if ANY replica address is reachable.
-// A reachable replica means it is listening for a primary connection,
-// which means either:
-//   - Another primary is already streaming to it, OR
-//   - It is waiting for a primary (our old role)
-//
-// In BOTH cases a server that was offline must NOT start as primary
-// because it has stale data. It must demote to replica first and
-// sync from the current primary.
-func probeForExistingPrimary(addrs []string) string {
-	for _, addr := range addrs {
-		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-		if err != nil {
-			continue
-		}
-		conn.Close()
-		return addr
-	}
-	return ""
-}
-
 func runPrimary(dbPath, replicaList string, heartbeat time.Duration, sig chan os.Signal) {
 	if replicaList == "" {
 		log.Fatal("Primary mode requires -replicas flag")
@@ -95,20 +73,9 @@ func runPrimary(dbPath, replicaList string, heartbeat time.Duration, sig chan os
 		addrs[i] = strings.TrimSpace(addrs[i])
 	}
 
-	// CRITICAL: Before starting as primary, ALWAYS check if any replica
-	// is reachable. If a replica is listening, another primary may already
-	// be streaming to it, or we were offline and have stale data.
-	// In either case we MUST NOT start as primary -- we exit with code 10
-	// so the recovery script can demote us to replica.
-	// This check runs regardless of whether a .primary marker exists.
-	active := probeForExistingPrimary(addrs)
-	if active != "" {
-		log.Printf("CRITICAL: Replica %s is reachable. Another primary may be active.", active)
-		log.Printf("Refusing to start as primary to prevent data loss.")
-		log.Printf("Exiting with code 10 so the recovery script can demote to replica.")
-		os.Exit(10)
-	}
-	log.Printf("[primary] no active replicas found, safe to start as primary")
+	// Safety: The ExecStartPre recovery script handles demotion if another
+	// primary is already active. By the time we get here, the script has
+	// already verified that it is safe for us to run as primary.
 
 	sender := internal.NewSender(internal.SenderConfig{
 		DBPath:            dbPath,
@@ -149,6 +116,7 @@ func runReplica(dbPath, listenAddr string, timeout time.Duration, onPromote stri
 		Timeout:   timeout,
 		DBPath:    dbPath,
 		OnPromote: onPromote,
+		OwnAddr:   listenAddr,
 		PeerAddrs: peerAddrs,
 	}, receiver)
 	failover.Start()

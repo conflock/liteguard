@@ -3,10 +3,10 @@ package internal
 import (
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"os/exec"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +17,7 @@ type FailoverConfig struct {
 	CheckInterval time.Duration
 	DBPath        string
 	OnPromote     string   // optional shell command to run on promotion
+	OwnAddr       string   // this replica's listen address (for election ranking)
 	PeerAddrs     []string // addresses of other replicas for leader election
 }
 
@@ -62,7 +63,8 @@ func NewFailover(cfg FailoverConfig, receiver *Receiver) *Failover {
 
 func (f *Failover) Start() {
 	go f.monitorLoop()
-	log.Printf("[failover] monitoring primary – timeout: %v", f.cfg.Timeout)
+	log.Printf("[failover] monitoring primary – timeout: %v, own=%s, peers=%v",
+		f.cfg.Timeout, f.cfg.OwnAddr, f.cfg.PeerAddrs)
 }
 
 func (f *Failover) Stop() {
@@ -95,12 +97,14 @@ func (f *Failover) check() {
 
 	gap := f.receiver.SecondsSinceHeartbeat()
 	if gap > f.cfg.Timeout.Seconds() {
-		log.Printf("[failover] primary timeout (%.1fs > %.1fs) – starting election", gap, f.cfg.Timeout.Seconds())
-		f.promote()
+		f.tryPromote()
 	}
 }
 
-func (f *Failover) promote() {
+// tryPromote implements deterministic leader election.
+// The replica with the lowest address among all reachable replicas
+// (including itself) wins. No randomness, no race conditions.
+func (f *Failover) tryPromote() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -108,28 +112,45 @@ func (f *Failover) promote() {
 		return
 	}
 
-	// Random wait so not all replicas try at the same time
-	jitter := time.Duration(rand.Intn(10000)) * time.Millisecond
-	log.Printf("[failover] election: waiting %.1fs...", jitter.Seconds())
-	time.Sleep(jitter)
-
-	// Stop listener FIRST so peers can see we are promoting
-	f.receiver.Stop()
-
-	// Brief pause so the port is fully released
-	time.Sleep(500 * time.Millisecond)
-
-	// Check if any peer ALSO stopped their listener (= also promoting)
-	if f.peerAlsoPromoting() {
-		// Another replica was faster. Restart our listener and stay replica.
-		log.Printf("[failover] another replica already promoted, restarting listener")
-		if err := f.receiver.Start(); err != nil {
-			log.Printf("[failover] CRITICAL: failed to restart receiver: %v", err)
+	// Collect all reachable replicas (peers that are still listening)
+	reachable := []string{}
+	if f.cfg.OwnAddr != "" {
+		reachable = append(reachable, f.cfg.OwnAddr)
+	}
+	for _, addr := range f.cfg.PeerAddrs {
+		if addr == "" {
+			continue
 		}
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			// Peer not reachable (offline or already promoted) -- skip
+			log.Printf("[failover] peer %s not reachable, skipping", addr)
+			continue
+		}
+		conn.Close()
+		reachable = append(reachable, addr)
+	}
+
+	if len(reachable) == 0 {
+		log.Printf("[failover] no peers reachable and no own addr, promoting")
+		f.doPromote()
 		return
 	}
 
-	// We won the election
+	sort.Strings(reachable)
+	winner := reachable[0]
+
+	if winner == f.cfg.OwnAddr {
+		log.Printf("[failover] I have the lowest address (%s) among %v – promoting", winner, reachable)
+		f.doPromote()
+	} else {
+		log.Printf("[failover] peer %s has lower address (mine=%s) – waiting", winner, f.cfg.OwnAddr)
+	}
+}
+
+func (f *Failover) doPromote() {
+	f.receiver.Stop()
+
 	f.role.Store(int32(RolePrimary))
 	f.promoted.Store(true)
 
@@ -143,25 +164,6 @@ func (f *Failover) promote() {
 	if f.cfg.OnPromote != "" {
 		go f.runPromoteHook()
 	}
-}
-
-// peerAlsoPromoting checks if any peer replica has ALSO stopped listening.
-// If a peer is NOT listening (connection refused), it means that peer
-// is also trying to promote. We yield to it and stay replica.
-// If all peers are still listening, we are the only one promoting -> we win.
-func (f *Failover) peerAlsoPromoting() bool {
-	for _, addr := range f.cfg.PeerAddrs {
-		if addr == "" {
-			continue
-		}
-		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-		if err != nil {
-			log.Printf("[failover] peer %s also not listening – yielding", addr)
-			return true
-		}
-		conn.Close()
-	}
-	return false
 }
 
 func (f *Failover) runPromoteHook() {

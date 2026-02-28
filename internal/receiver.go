@@ -27,6 +27,7 @@ type Receiver struct {
 	lastSequence   atomic.Uint64
 	lastHeartbeat  atomic.Int64
 	stop           chan struct{}
+	stopped        atomic.Bool
 	mu             sync.Mutex
 }
 
@@ -36,13 +37,15 @@ func NewReceiver(cfg ReceiverConfig) *Receiver {
 		walPath: cfg.DBPath + "-wal",
 		stop:    make(chan struct{}),
 	}
-	// Seed heartbeat timer so failover can trigger even if no primary
-	// ever connects. Without this, replicas would wait forever.
+	// Seed heartbeat so failover can trigger even if no primary ever connects
 	r.lastHeartbeat.Store(time.Now().UnixMilli())
 	return r
 }
 
 func (r *Receiver) Start() error {
+	r.stop = make(chan struct{})
+	r.stopped.Store(false)
+
 	ln, err := net.Listen("tcp", r.cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", r.cfg.ListenAddr, err)
@@ -56,6 +59,9 @@ func (r *Receiver) Start() error {
 }
 
 func (r *Receiver) Stop() {
+	if r.stopped.Swap(true) {
+		return // already stopped
+	}
 	close(r.stop)
 	if r.listener != nil {
 		r.listener.Close()
