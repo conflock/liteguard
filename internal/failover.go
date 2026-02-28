@@ -3,6 +3,8 @@ package internal
 import (
 	"fmt"
 	"log"
+	"math/rand"
+	"net"
 	"os"
 	"os/exec"
 	"sync"
@@ -14,7 +16,8 @@ type FailoverConfig struct {
 	Timeout       time.Duration
 	CheckInterval time.Duration
 	DBPath        string
-	OnPromote     string // optional shell command to run on promotion
+	OnPromote     string   // optional shell command to run on promotion
+	PeerAddrs     []string // addresses of other replicas for leader election
 }
 
 type Role int32
@@ -111,6 +114,18 @@ func (f *Failover) promote() {
 		return
 	}
 
+	// Leader election: wait a random delay (0-5s) then check if any
+	// peer replica has already stopped listening (meaning it promoted).
+	// This prevents multiple replicas from promoting simultaneously.
+	jitter := time.Duration(rand.Intn(5000)) * time.Millisecond
+	log.Printf("[failover] election: waiting %.1fs before promote check...", jitter.Seconds())
+	time.Sleep(jitter)
+
+	if f.peerAlreadyPromoted() {
+		log.Printf("[failover] another replica already promoted, staying as replica")
+		return
+	}
+
 	f.receiver.Stop()
 
 	f.role.Store(int32(RolePrimary))
@@ -126,6 +141,27 @@ func (f *Failover) promote() {
 	if f.cfg.OnPromote != "" {
 		go f.runPromoteHook()
 	}
+}
+
+// peerAlreadyPromoted checks if any other replica has already promoted
+// by trying to connect to their listen port.  A promoted replica stops
+// its listener, so a "connection refused" means it already promoted.
+// If the peer is still listening (connection succeeds), it has NOT
+// promoted yet.
+func (f *Failover) peerAlreadyPromoted() bool {
+	for _, addr := range f.cfg.PeerAddrs {
+		if addr == "" {
+			continue
+		}
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			// Connection refused = peer stopped listening = peer promoted
+			log.Printf("[failover] peer %s not listening (likely promoted)", addr)
+			return true
+		}
+		conn.Close()
+	}
+	return false
 }
 
 func (f *Failover) runPromoteHook() {
