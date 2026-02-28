@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"database/sql"
 	"fmt"
 	"io"
 	"log"
@@ -9,8 +10,9 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 type SenderConfig struct {
@@ -28,7 +30,7 @@ type Sender struct {
 	mu        sync.RWMutex
 	stop      chan struct{}
 	lastSize  int64
-	walGuard  *os.File // shared lock on DB to prevent WAL auto-checkpoint
+	walGuard  *sql.DB // read connection that blocks WAL auto-checkpoint
 }
 
 type replicaConn struct {
@@ -66,19 +68,21 @@ func (s *Sender) Start() error {
 		return fmt.Errorf("WAL directory not accessible: %w", err)
 	}
 
-	// Hold the DB file open with a shared (read) lock.
-	// SQLite skips WAL auto-checkpoint while any shared lock exists,
-	// keeping the WAL file alive for the poll loop to read and stream.
-	f, err := os.Open(s.cfg.DBPath)
+	// Open a SQLite connection and disable auto-checkpoint.
+	// This keeps the WAL file alive so the poll loop can read
+	// and stream new frames before they get checkpointed away.
+	db, err := sql.Open("sqlite", s.cfg.DBPath+"?mode=ro&_pragma=journal_mode(wal)&_pragma=wal_autocheckpoint(0)")
 	if err != nil {
-		return fmt.Errorf("open DB for WAL guard: %w", err)
+		return fmt.Errorf("open WAL guard connection: %w", err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
-		f.Close()
-		return fmt.Errorf("acquire shared lock on DB: %w", err)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return fmt.Errorf("WAL guard ping: %w", err)
 	}
-	s.walGuard = f
-	log.Printf("[sender] WAL guard lock acquired on %s", s.cfg.DBPath)
+	s.walGuard = db
+	log.Printf("[sender] WAL guard active (wal_autocheckpoint=0) on %s", s.cfg.DBPath)
 
 	for _, r := range s.replicas {
 		go s.connectLoop(r)
@@ -94,7 +98,6 @@ func (s *Sender) Start() error {
 func (s *Sender) Stop() {
 	close(s.stop)
 	if s.walGuard != nil {
-		syscall.Flock(int(s.walGuard.Fd()), syscall.LOCK_UN)
 		s.walGuard.Close()
 	}
 	for _, r := range s.replicas {
