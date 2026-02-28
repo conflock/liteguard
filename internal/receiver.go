@@ -138,30 +138,19 @@ func (r *Receiver) handleConnection(conn net.Conn) {
 	}
 }
 
-// applyWAL writes WAL frame data to the local WAL file, then runs a
-// PASSIVE checkpoint so that SQLite merges the frames into the main
-// database file. This makes the data immediately readable.
+// applyWAL overwrites the local WAL file with the full WAL snapshot
+// received from the primary, then checkpoints it into the main DB.
+// The sender streams the complete WAL content (not deltas) so that
+// salt values and frame checksums stay consistent with the database.
 func (r *Receiver) applyWAL(msg *Message) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	f, err := os.OpenFile(r.walPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
-	if err != nil {
-		return fmt.Errorf("open WAL: %w", err)
-	}
-
-	if _, err := f.Write(msg.Payload); err != nil {
-		f.Close()
+	if err := os.WriteFile(r.walPath, msg.Payload, 0644); err != nil {
 		return fmt.Errorf("write WAL: %w", err)
 	}
 
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return fmt.Errorf("sync WAL: %w", err)
-	}
-	f.Close()
-
-	// Checkpoint WAL frames into the main DB so data is immediately readable.
+	// Checkpoint into main DB so data is immediately readable.
 	if _, err := r.db.Exec("PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
 		log.Printf("[receiver] checkpoint warning: %v", err)
 	}

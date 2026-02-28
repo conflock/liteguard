@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -223,34 +222,20 @@ func (s *Sender) checkWAL() {
 	}
 
 	currentSize := info.Size()
-	if currentSize <= s.lastSize {
+	if currentSize == s.lastSize {
 		return
 	}
 
-	f, err := os.Open(s.walPath)
-	if err != nil {
-		log.Printf("[sender] open WAL: %v", err)
-		return
-	}
-	defer f.Close()
-
-	// Seek to where we left off
-	if s.lastSize > 0 {
-		if _, err := f.Seek(s.lastSize, io.SeekStart); err != nil {
-			log.Printf("[sender] seek WAL: %v", err)
-			return
-		}
-	}
-
-	newData := make([]byte, currentSize-s.lastSize)
-	n, err := io.ReadFull(f, newData)
+	// Send the complete WAL file so that the receiver always has a
+	// consistent copy with correct salt values and frame checksums.
+	data, err := os.ReadFile(s.walPath)
 	if err != nil {
 		log.Printf("[sender] read WAL: %v", err)
 		return
 	}
 
 	seq := s.sequence.Add(1)
-	msg := NewWALFrame(seq, newData[:n])
+	msg := NewWALFrame(seq, data)
 
 	s.broadcast(msg)
 	s.lastSize = currentSize
