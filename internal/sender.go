@@ -1,9 +1,12 @@
 package internal
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -165,17 +168,181 @@ func (s *Sender) connectLoop(r *replicaConn) {
 			continue
 		}
 
+		log.Printf("[sender] connected to replica %s, waiting for sync request...", r.addr)
+
+		if err := s.handleInitialSync(conn, r); err != nil {
+			log.Printf("[sender] initial sync with %s failed: %v", r.addr, err)
+			conn.Close()
+			r.healthy.Store(false)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
 		r.mu.Lock()
 		r.conn = conn
 		r.mu.Unlock()
 		r.healthy.Store(true)
-		log.Printf("[sender] connected to replica %s", r.addr)
+		log.Printf("[sender] replica %s synced and ready for WAL stream", r.addr)
 
 		s.listenAcks(r)
 
 		r.healthy.Store(false)
 		log.Printf("[sender] disconnected from %s, reconnecting...", r.addr)
 	}
+}
+
+// handleInitialSync waits for a SyncRequest from the replica, compares DB
+// hashes, and sends a full snapshot if needed. Returns nil when the replica
+// is ready for normal WAL streaming.
+func (s *Sender) handleInitialSync(conn net.Conn, r *replicaConn) error {
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	msg, err := Decode(conn)
+	if err != nil {
+		if err == io.EOF {
+			// Old replica without sync support -- skip handshake
+			log.Printf("[sender] replica %s uses legacy protocol (no sync request), proceeding", r.addr)
+			return nil
+		}
+		return fmt.Errorf("read sync request: %w", err)
+	}
+
+	if msg.Type != MsgTypeSyncRequest {
+		// Old replica sending ACKs or other messages -- skip handshake
+		log.Printf("[sender] replica %s sent type=%d instead of SyncRequest, proceeding", r.addr, msg.Type)
+		return nil
+	}
+
+	replicaHash := msg.Payload
+	log.Printf("[sender] sync request from %s (hash=%x)", r.addr, replicaHash)
+
+	localHash, err := s.computeDBHash()
+	if err != nil {
+		return fmt.Errorf("compute local DB hash: %w", err)
+	}
+
+	if bytes.Equal(localHash, replicaHash) {
+		log.Printf("[sender] replica %s is in sync, no snapshot needed", r.addr)
+		resp := NewSyncResponse(0, nil)
+		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := resp.Encode(conn); err != nil {
+			return fmt.Errorf("send empty sync response: %w", err)
+		}
+	} else {
+		log.Printf("[sender] replica %s is out of sync (local=%x), sending snapshot...", r.addr, localHash)
+		snapshot, err := s.createSnapshot()
+		if err != nil {
+			return fmt.Errorf("create snapshot: %w", err)
+		}
+		resp := NewSyncResponse(0, snapshot)
+		conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
+		if err := resp.Encode(conn); err != nil {
+			return fmt.Errorf("send snapshot (%d bytes): %w", len(snapshot), err)
+		}
+		log.Printf("[sender] snapshot sent to %s (%d bytes)", r.addr, len(snapshot))
+	}
+
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	ack, err := Decode(conn)
+	if err != nil {
+		return fmt.Errorf("read sync ack: %w", err)
+	}
+	if ack.Type != MsgTypeSyncAck {
+		return fmt.Errorf("expected SyncAck, got type=%d", ack.Type)
+	}
+
+	log.Printf("[sender] sync ack received from %s", r.addr)
+	return nil
+}
+
+// computeDBHash calculates SHA256 of the main database file.
+// Temporarily releases the WAL guard to checkpoint pending WAL frames
+// into the main DB so the hash reflects the current state.
+func (s *Sender) computeDBHash() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Temporarily release WAL guard so checkpoint can proceed
+	if s.walTx != nil {
+		s.walTx.Rollback()
+		s.walTx = nil
+	}
+
+	// Checkpoint WAL into main DB
+	ckDSN := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)", s.cfg.DBPath)
+	ckDB, err := sql.Open("sqlite", ckDSN)
+	if err == nil {
+		ckDB.SetMaxOpenConns(1)
+		ckDB.Exec("PRAGMA wal_checkpoint(PASSIVE)")
+		ckDB.Close()
+	}
+
+	// Hash the main DB file
+	f, err := os.Open(s.cfg.DBPath)
+	if err != nil {
+		s.reacquireWALGuard()
+		return nil, fmt.Errorf("open DB for hashing: %w", err)
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		f.Close()
+		s.reacquireWALGuard()
+		return nil, fmt.Errorf("hash DB: %w", err)
+	}
+	f.Close()
+
+	// Re-acquire WAL guard
+	s.reacquireWALGuard()
+
+	return h.Sum(nil), nil
+}
+
+// createSnapshot checkpoints and reads the full DB file for transfer.
+func (s *Sender) createSnapshot() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.walTx != nil {
+		s.walTx.Rollback()
+		s.walTx = nil
+	}
+
+	ckDSN := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)", s.cfg.DBPath)
+	ckDB, err := sql.Open("sqlite", ckDSN)
+	if err == nil {
+		ckDB.SetMaxOpenConns(1)
+		ckDB.Exec("PRAGMA wal_checkpoint(PASSIVE)")
+		ckDB.Close()
+	}
+
+	data, err := os.ReadFile(s.cfg.DBPath)
+	if err != nil {
+		s.reacquireWALGuard()
+		return nil, fmt.Errorf("read DB: %w", err)
+	}
+
+	s.reacquireWALGuard()
+	return data, nil
+}
+
+// reacquireWALGuard re-establishes the read transaction that prevents
+// external WAL checkpointing.
+func (s *Sender) reacquireWALGuard() {
+	if s.walGuard == nil {
+		return
+	}
+	ctx := context.Background()
+	tx, err := s.walGuard.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		log.Printf("[sender] WARNING: failed to re-acquire WAL guard: %v", err)
+		return
+	}
+	if _, err := tx.ExecContext(ctx, "SELECT COUNT(1) FROM _liteguard_lock"); err != nil {
+		tx.Rollback()
+		log.Printf("[sender] WARNING: WAL guard read lock failed: %v", err)
+		return
+	}
+	s.walTx = tx
+	log.Printf("[sender] WAL guard re-acquired")
 }
 
 // listenAcks reads ACK messages from replica until error.

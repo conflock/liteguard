@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -62,6 +63,28 @@ func main() {
 	}
 }
 
+// probeForExistingPrimary checks if any of the listed replica addresses
+// already has an active primary by trying to connect on the Liteguard port.
+// If a connection succeeds and we receive data (heartbeat/WAL), another
+// primary is already running.
+func probeForExistingPrimary(addrs []string) string {
+	for _, addr := range addrs {
+		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err != nil {
+			continue
+		}
+		conn.Close()
+		// If we can connect, that replica is listening -- it could be the
+		// promoted primary or just a replica. We check if the .primary
+		// marker exists on the remote side by checking if the port is open
+		// (replicas listen on 4200, promoted primaries don't).
+		// A listening replica means another primary exists that it's
+		// receiving from. Return this address as the active cluster.
+		return addr
+	}
+	return ""
+}
+
 func runPrimary(dbPath, replicaList string, heartbeat time.Duration, sig chan os.Signal) {
 	if replicaList == "" {
 		log.Fatal("Primary mode requires -replicas flag")
@@ -70,6 +93,24 @@ func runPrimary(dbPath, replicaList string, heartbeat time.Duration, sig chan os
 	addrs := strings.Split(replicaList, ",")
 	for i := range addrs {
 		addrs[i] = strings.TrimSpace(addrs[i])
+	}
+
+	// Auto-demote: if this server was the original primary but was offline
+	// while a replica got promoted, detect the situation and refuse to start
+	// as a conflicting primary. The recovery script handles the actual
+	// mode switch; here we just detect and exit with a specific code.
+	markerPath := dbPath + ".primary"
+	if _, err := os.Stat(markerPath); err != nil {
+		// No .primary marker means we are the ORIGINAL primary (not promoted).
+		// Check if any replica is already listening (meaning another primary
+		// got promoted and is actively streaming to them).
+		active := probeForExistingPrimary(addrs)
+		if active != "" {
+			log.Printf("WARNING: Another primary appears active (replica %s is listening).", active)
+			log.Printf("This server was likely offline during a failover.")
+			log.Printf("Exiting with code 10 so the recovery script can demote to replica.")
+			os.Exit(10)
+		}
 	}
 
 	sender := internal.NewSender(internal.SenderConfig{

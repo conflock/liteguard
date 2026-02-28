@@ -8,14 +8,20 @@ import (
 )
 
 const (
-	MsgTypeWALFrame  uint8 = 1
-	MsgTypeHeartbeat uint8 = 2
-	MsgTypeAck       uint8 = 3
+	MsgTypeWALFrame     uint8 = 1
+	MsgTypeHeartbeat    uint8 = 2
+	MsgTypeAck          uint8 = 3
+	MsgTypeSyncRequest  uint8 = 4 // Replica -> Primary: payload = SHA256 of local DB (32 bytes)
+	MsgTypeSyncResponse uint8 = 5 // Primary -> Replica: payload = full DB snapshot (empty = already in sync)
+	MsgTypeSyncAck      uint8 = 6 // Replica -> Primary: sync complete, ready for WAL stream
 
 	// Header: type(1) + sequence(8) + timestamp(8) + payload_len(4) = 21 bytes
 	HeaderSize = 21
 
 	ProtocolVersion uint8 = 1
+
+	// Max snapshot size: 512 MB (larger than the 64 MB WAL limit)
+	MaxSnapshotSize uint32 = 512 * 1024 * 1024
 )
 
 type Message struct {
@@ -47,6 +53,34 @@ func NewHeartbeat(seq uint64) *Message {
 func NewAck(seq uint64) *Message {
 	return &Message{
 		Type:      MsgTypeAck,
+		Sequence:  seq,
+		Timestamp: time.Now().UnixMilli(),
+	}
+}
+
+func NewSyncRequest(seq uint64, dbHash []byte) *Message {
+	return &Message{
+		Type:       MsgTypeSyncRequest,
+		Sequence:   seq,
+		Timestamp:  time.Now().UnixMilli(),
+		PayloadLen: uint32(len(dbHash)),
+		Payload:    dbHash,
+	}
+}
+
+func NewSyncResponse(seq uint64, dbSnapshot []byte) *Message {
+	return &Message{
+		Type:       MsgTypeSyncResponse,
+		Sequence:   seq,
+		Timestamp:  time.Now().UnixMilli(),
+		PayloadLen: uint32(len(dbSnapshot)),
+		Payload:    dbSnapshot,
+	}
+}
+
+func NewSyncAck(seq uint64) *Message {
+	return &Message{
+		Type:      MsgTypeSyncAck,
 		Sequence:  seq,
 		Timestamp: time.Now().UnixMilli(),
 	}
@@ -86,8 +120,12 @@ func Decode(r io.Reader) (*Message, error) {
 		PayloadLen: binary.BigEndian.Uint32(header[17:21]),
 	}
 
-	if msg.PayloadLen > 64*1024*1024 {
-		return nil, fmt.Errorf("payload too large: %d bytes", msg.PayloadLen)
+	maxSize := uint32(64 * 1024 * 1024)
+	if msg.Type == MsgTypeSyncResponse {
+		maxSize = MaxSnapshotSize
+	}
+	if msg.PayloadLen > maxSize {
+		return nil, fmt.Errorf("payload too large: %d bytes (max %d)", msg.PayloadLen, maxSize)
 	}
 
 	if msg.PayloadLen > 0 {
