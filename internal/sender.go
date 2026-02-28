@@ -30,7 +30,8 @@ type Sender struct {
 	mu        sync.RWMutex
 	stop      chan struct{}
 	lastSize  int64
-	walGuard  *sql.DB // read connection that blocks WAL auto-checkpoint
+	walGuard  *sql.DB  // connection pool (max 1) that holds the reader
+	walTx     *sql.Tx  // long-lived BEGIN that blocks WAL checkpoint
 }
 
 type replicaConn struct {
@@ -68,21 +69,31 @@ func (s *Sender) Start() error {
 		return fmt.Errorf("WAL directory not accessible: %w", err)
 	}
 
-	// Open a SQLite connection and disable auto-checkpoint.
-	// This keeps the WAL file alive so the poll loop can read
-	// and stream new frames before they get checkpointed away.
-	db, err := sql.Open("sqlite", s.cfg.DBPath+"?mode=ro&_pragma=journal_mode(wal)&_pragma=wal_autocheckpoint(0)")
+	// Open a read-only SQLite connection and start a long-lived read
+	// transaction. SQLite cannot checkpoint the WAL while any reader
+	// holds a snapshot, so the WAL file stays alive for our poll loop
+	// to read and stream to replicas.
+	db, err := sql.Open("sqlite", s.cfg.DBPath+"?mode=ro")
 	if err != nil {
 		return fmt.Errorf("open WAL guard connection: %w", err)
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	if err := db.Ping(); err != nil {
+
+	tx, err := db.Begin()
+	if err != nil {
 		db.Close()
-		return fmt.Errorf("WAL guard ping: %w", err)
+		return fmt.Errorf("begin WAL guard transaction: %w", err)
+	}
+	// Force the transaction to actually acquire a read lock
+	if _, err := tx.Exec("SELECT 1"); err != nil {
+		tx.Rollback()
+		db.Close()
+		return fmt.Errorf("WAL guard read lock: %w", err)
 	}
 	s.walGuard = db
-	log.Printf("[sender] WAL guard active (wal_autocheckpoint=0) on %s", s.cfg.DBPath)
+	s.walTx = tx
+	log.Printf("[sender] WAL guard active (read transaction held) on %s", s.cfg.DBPath)
 
 	for _, r := range s.replicas {
 		go s.connectLoop(r)
@@ -97,6 +108,9 @@ func (s *Sender) Start() error {
 
 func (s *Sender) Stop() {
 	close(s.stop)
+	if s.walTx != nil {
+		s.walTx.Rollback()
+	}
 	if s.walGuard != nil {
 		s.walGuard.Close()
 	}
