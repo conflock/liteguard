@@ -24,6 +24,7 @@ func main() {
 	timeout := flag.Duration("timeout", 10*time.Second, "Primary timeout before failover (replica mode)")
 	onPromote := flag.String("on-promote", "", "Shell command to run on promotion to primary (replica mode)")
 	peers := flag.String("peers", "", "Comma-separated peer replica addresses for leader election (replica mode)")
+	healthAddr := flag.String("health", ":4201", "TCP address for primary health check listener")
 	showVersion := flag.Bool("version", false, "Show version")
 	flag.Parse()
 
@@ -55,7 +56,7 @@ func main() {
 
 	switch *mode {
 	case "primary":
-		runPrimary(*dbPath, *replicas, *heartbeat, sig)
+		runPrimary(*dbPath, *replicas, *heartbeat, *healthAddr, sig)
 	case "replica":
 		runReplica(*dbPath, *listenAddr, *timeout, *onPromote, *peers, sig)
 	default:
@@ -63,7 +64,7 @@ func main() {
 	}
 }
 
-func runPrimary(dbPath, replicaList string, heartbeat time.Duration, sig chan os.Signal) {
+func runPrimary(dbPath, replicaList string, heartbeat time.Duration, healthAddr string, sig chan os.Signal) {
 	if replicaList == "" {
 		log.Fatal("Primary mode requires -replicas flag")
 	}
@@ -73,14 +74,11 @@ func runPrimary(dbPath, replicaList string, heartbeat time.Duration, sig chan os
 		addrs[i] = strings.TrimSpace(addrs[i])
 	}
 
-	// Safety: The ExecStartPre recovery script handles demotion if another
-	// primary is already active. By the time we get here, the script has
-	// already verified that it is safe for us to run as primary.
-
 	sender := internal.NewSender(internal.SenderConfig{
 		DBPath:            dbPath,
 		Replicas:          addrs,
 		HeartbeatInterval: heartbeat,
+		HealthAddr:        healthAddr,
 	})
 
 	if err := sender.Start(); err != nil {

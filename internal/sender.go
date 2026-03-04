@@ -23,19 +23,21 @@ type SenderConfig struct {
 	Replicas          []string
 	HeartbeatInterval time.Duration
 	WALPollInterval   time.Duration
+	HealthAddr        string // TCP address for health check (e.g. ":4201")
 }
 
 type Sender struct {
-	cfg       SenderConfig
-	walPath   string
-	sequence  atomic.Uint64
-	replicas  []*replicaConn
-	mu        sync.RWMutex
-	stop        chan struct{}
-	lastSize    int64
-	lastModTime time.Time
-	walGuard    *sql.DB
-	walTx       *sql.Tx
+	cfg            SenderConfig
+	walPath        string
+	sequence       atomic.Uint64
+	replicas       []*replicaConn
+	mu             sync.RWMutex
+	stop           chan struct{}
+	lastSize       int64
+	lastModTime    time.Time
+	walGuard       *sql.DB
+	walTx          *sql.Tx
+	healthListener net.Listener
 }
 
 type replicaConn struct {
@@ -130,12 +132,26 @@ func (s *Sender) Start() error {
 	go s.walPollLoop()
 	go s.heartbeatLoop()
 
+	if s.cfg.HealthAddr != "" {
+		hl, err := net.Listen("tcp", s.cfg.HealthAddr)
+		if err != nil {
+			log.Printf("[sender] WARNING: health listener on %s failed: %v", s.cfg.HealthAddr, err)
+		} else {
+			s.healthListener = hl
+			go s.healthLoop()
+			log.Printf("[sender] health listener active on %s", s.cfg.HealthAddr)
+		}
+	}
+
 	log.Printf("[sender] started – watching %s, streaming to %d replica(s)", s.walPath, len(s.replicas))
 	return nil
 }
 
 func (s *Sender) Stop() {
 	close(s.stop)
+	if s.healthListener != nil {
+		s.healthListener.Close()
+	}
 	if s.walTx != nil {
 		s.walTx.Rollback()
 	}
@@ -150,6 +166,24 @@ func (s *Sender) Stop() {
 		r.mu.Unlock()
 	}
 	log.Println("[sender] stopped")
+}
+
+// healthLoop accepts TCP connections on the health port and immediately
+// closes them. The sole purpose is to let recovery scripts detect a
+// running primary via "nc -z <addr> 4201".
+func (s *Sender) healthLoop() {
+	for {
+		conn, err := s.healthListener.Accept()
+		if err != nil {
+			select {
+			case <-s.stop:
+				return
+			default:
+				continue
+			}
+		}
+		conn.Close()
+	}
 }
 
 func (s *Sender) connectLoop(r *replicaConn) {
