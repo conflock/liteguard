@@ -101,9 +101,24 @@ func (f *Failover) check() {
 	}
 }
 
-// tryPromote implements deterministic leader election.
-// The replica with the lowest address among all reachable replicas
-// (including itself) wins. No randomness, no race conditions.
+// healthPort converts a replica address (host:4200) to the corresponding
+// health-check address (host:4201) used by primaries.
+func healthPort(replicaAddr string) string {
+	host, _, err := net.SplitHostPort(replicaAddr)
+	if err != nil {
+		return replicaAddr
+	}
+	return net.JoinHostPort(host, "4201")
+}
+
+// tryPromote implements safe leader election.
+//
+// Step 1: Check if any peer already claimed primary (health port 4201 open).
+//         If so, abort — that peer is the winner.
+// Step 2: Among all replicas still listening on 4200 (including self),
+//         the one with the lowest address wins.
+// Step 3: The winner opens health port 4201 FIRST (claim), waits 3 seconds
+//         for the loser to see it, then proceeds with promotion.
 func (f *Failover) tryPromote() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -112,7 +127,19 @@ func (f *Failover) tryPromote() {
 		return
 	}
 
-	// Collect all reachable replicas (peers that are still listening)
+	// Step 1: If any peer already has health port 4201 open, another
+	// replica already won the election. Stand down.
+	for _, addr := range f.cfg.PeerAddrs {
+		hp := healthPort(addr)
+		conn, err := net.DialTimeout("tcp", hp, 2*time.Second)
+		if err == nil {
+			conn.Close()
+			log.Printf("[failover] peer %s has health port open — already primary, standing down", hp)
+			return
+		}
+	}
+
+	// Step 2: Determine the winner among reachable replicas (port 4200).
 	reachable := []string{}
 	if f.cfg.OwnAddr != "" {
 		reachable = append(reachable, f.cfg.OwnAddr)
@@ -123,7 +150,6 @@ func (f *Failover) tryPromote() {
 		}
 		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 		if err != nil {
-			// Peer not reachable (offline or already promoted) -- skip
 			log.Printf("[failover] peer %s not reachable, skipping", addr)
 			continue
 		}
@@ -140,12 +166,40 @@ func (f *Failover) tryPromote() {
 	sort.Strings(reachable)
 	winner := reachable[0]
 
-	if winner == f.cfg.OwnAddr {
-		log.Printf("[failover] I have the lowest address (%s) among %v – promoting", winner, reachable)
-		f.doPromote()
-	} else {
+	if winner != f.cfg.OwnAddr {
 		log.Printf("[failover] peer %s has lower address (mine=%s) – waiting", winner, f.cfg.OwnAddr)
+		return
 	}
+
+	// Step 3: I am the winner. Open health port 4201 immediately to
+	// signal other replicas that the election is decided. Wait before
+	// running the promote hook so the loser sees port 4201 on the next
+	// check cycle and aborts its own election.
+	ownHealth := healthPort(f.cfg.OwnAddr)
+	claimLn, err := net.Listen("tcp", ownHealth)
+	if err != nil {
+		log.Printf("[failover] WARNING: could not open claim port %s: %v — promoting anyway", ownHealth, err)
+	} else {
+		log.Printf("[failover] election claim: opened %s, waiting 5s for peers to see it", ownHealth)
+		go func() {
+			for {
+				c, err := claimLn.Accept()
+				if err != nil {
+					return
+				}
+				c.Close()
+			}
+		}()
+	}
+
+	time.Sleep(5 * time.Second)
+
+	if claimLn != nil {
+		claimLn.Close()
+	}
+
+	log.Printf("[failover] I have the lowest address (%s) among %v – promoting", winner, reachable)
+	f.doPromote()
 }
 
 func (f *Failover) doPromote() {
